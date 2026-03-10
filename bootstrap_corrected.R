@@ -59,6 +59,6 @@ if (boot_results$overall_cv < 0.05) {
 
 # Save bootstrap results
 write.csv(boot_results$bootstrap_means, "bootstrap_means.csv", row.names = FALSE)
-write.csv(data.frame(sample = colnames(entropy_matrix), 
+write.csv(data.frame(sample = colnames(entropy_matrix_corrected), 
                      cv = boot_results$cv_per_sample),
           "bootstrap_cv_per_sample.csv", row.names = FALSE)
