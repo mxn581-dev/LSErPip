@@ -83,7 +83,8 @@ cat("Final edges after cleaning:", nrow(edges), "\n\n")
 # STEP 2: Load Expression Data (68 Samples)
 cat("STEP 2: Loading expression data...\n")
 
-expr_data <- read.csv(expr_data <- read.csv("", header = TRUE, row.names = 1), header = TRUE, row.names = 1,
+expr_data <- read.csv("path/to/your/expression_matrix.csv",
+                      header = TRUE, row.names = 1,
                       stringsAsFactors = FALSE, check.names = FALSE)
 
 cat("Expression (before filtering):", nrow(expr_data), "genes x", 
