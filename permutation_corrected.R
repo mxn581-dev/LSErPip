@@ -1,137 +1,197 @@
-run_permutation_corrected <- function(adj_m, expr_sub, maxSR,
-                                      original_SR,
-                                      n_permutations = 100,
-                                      seed = 456,
-                                      n_cores = parallel::detectCores() - 1) {
+run_perturbation_corrected <- function(network, adj_m, expr_sub, maxSR,
+                                       original_SR,
+                                       perturbation_rates = c(0.05, 0.10, 0.20),
+                                       n_iterations = 100,
+                                       seed = 789,
+                                       n_cores = parallel::detectCores() - 1) {
   
-  # Convert to sparse once — ~99% of adj_m is zeros
+  n_samples <- ncol(expr_sub)
+  mc_genes <- rownames(adj_m)
+  n_genes <- length(mc_genes)
+  
+  # Convert to sparse once
   if (!inherits(adj_m, "sparseMatrix")) {
     adj_m <- Matrix::Matrix(adj_m, sparse = TRUE)
   }
   
-  n_samples <- ncol(expr_sub)
-  n_genes <- nrow(expr_sub)
+  # Extract existing edges as (i,j) pairs from upper triangle
+  adj_upper <- Matrix::triu(adj_m)
+  edge_idx <- Matrix::which(adj_upper > 0, arr.ind = TRUE)
+  original_edges <- nrow(edge_idx)
   
-  cat("Running", n_permutations, "permutations (corrected SR) on", n_cores, "cores...\n")
+  # All possible non-edge pairs would be huge — instead we sample on the fly
   
-  # Reproducible parallel seeds
-  set.seed(seed)
-  perm_seeds <- sample.int(.Machine$integer.max, n_permutations)
+  results_list <- list()
   
-  perm_fn <- function(i) {
-    set.seed(perm_seeds[i])
+  for (rate in perturbation_rates) {
     
-    # Shuffle within each column via index matrix
-    perm_idx <- vapply(seq_len(n_samples), function(j) sample.int(n_genes),
-                       integer(n_genes))
-    perm_exp <- expr_sub[cbind(as.vector(perm_idx),
-                  rep(seq_len(n_samples), each = n_genes))]
-    dim(perm_exp) <- dim(expr_sub)
+    cat(sprintf("\n=== Testing %.0f%% edge perturbation (corrected SR) ===\n", rate * 100))
     
-    # Vectorized SR for ALL samples at once (matrix-matrix multiply)
-    # Mass action: sumexp = A %*% X  (genes x samples, one shot)
-    sumexp_m <- as.matrix(adj_m %*% perm_exp)
+    n_to_modify <- round(original_edges * rate)
+    n_to_delete <- round(n_to_modify / 2)
+    n_to_add <- round(n_to_modify / 2)
     
-    # Stationary distribution: pi_i = x_i * sumexp_i / Z
-    invP_m <- perm_exp * sumexp_m
-    nf <- colSums(invP_m)
-    nf[nf == 0] <- 1
-    invP_m <- t(t(invP_m) / nf)
+    set.seed(seed)
+    iter_seeds <- sample.int(.Machine$integer.max, n_iterations)
     
-    # Stochastic matrix per sample and local entropy
-    # Done sample-by-sample here because p_m is genes x genes per sample
-    SR_vec <- numeric(n_samples)
-    for (s in seq_len(n_samples)) {
-      se <- sumexp_m[, s]
-      se[se == 0] <- 1
-      # WRONG:  adj_m * perm_exp[, s]          → row-wise (x_i)
-# RIGHT:  t(t(adj_m) * perm_exp[, s])    → column-wise (x_j)
-      p_m <- t(t(adj_m) * perm_exp[, s])
-      p_m <- p_m / se
+    perturb_fn <- function(iter) {
+      set.seed(iter_seeds[iter])
       
-      # Local entropy via sparse operations
-      p_vals <- p_m@x               # nonzero entries only
-      log_vals <- log(p_vals)
-      p_log <- p_m
-      p_log@x <- p_vals * log_vals
-      S_v <- -Matrix::rowSums(p_log)
+      # ---- Perturb edges directly on sparse matrix ----
       
-      SR_vec[s] <- sum(invP_m[, s] * S_v) / maxSR
+      # Delete random edges
+      keep_mask <- rep(TRUE, original_edges)
+      if (n_to_delete > 0) {
+        del_idx <- sample.int(original_edges, min(n_to_delete, original_edges))
+        keep_mask[del_idx] <- FALSE
+      }
+      remaining <- edge_idx[keep_mask, , drop = FALSE]
+      
+      # Add random edges (avoiding self-loops and duplicates)
+      new_i <- integer(0)
+      new_j <- integer(0)
+      if (n_to_add > 0) {
+        # Oversample to account for self-loops and duplicates
+        cand_i <- sample.int(n_genes, n_to_add * 3, replace = TRUE)
+        cand_j <- sample.int(n_genes, n_to_add * 3, replace = TRUE)
+        valid <- cand_i != cand_j
+        cand_i <- cand_i[valid]
+        cand_j <- cand_j[valid]
+        # Canonicalize to upper triangle
+        swap <- cand_i > cand_j
+        tmp <- cand_i[swap]
+        cand_i[swap] <- cand_j[swap]
+        cand_j[swap] <- tmp
+        # Deduplicate
+        edge_keys <- paste0(cand_i, "_", cand_j)
+        uniq <- !duplicated(edge_keys)
+        cand_i <- cand_i[uniq]
+        cand_j <- cand_j[uniq]
+        n_take <- min(n_to_add, length(cand_i))
+        new_i <- cand_i[seq_len(n_take)]
+        new_j <- cand_j[seq_len(n_take)]
+      }
+      
+      # Build perturbed sparse adjacency (symmetric)
+      all_i <- c(remaining[, 1], new_i)
+      all_j <- c(remaining[, 2], new_j)
+      # Both directions for symmetric matrix
+      adj_pert <- Matrix::sparseMatrix(
+        i = c(all_i, all_j),
+        j = c(all_j, all_i),
+        x = 1,
+        dims = c(n_genes, n_genes),
+        dimnames = list(mc_genes, mc_genes)
+      )
+      # sparseMatrix sums duplicates, clamp to binary
+      adj_pert@x[adj_pert@x > 1] <- 1
+      
+      edge_count <- Matrix::nnzero(Matrix::triu(adj_pert))
+      
+      # ---- maxSR for perturbed network ----
+      maxSR_pert <- tryCatch({
+        ev <- RSpectra::eigs_sym(adj_pert, k = 1, which = "LM")
+        if (ev$values[1] <= 1) return(rep(NA, n_samples + 1))
+        log(ev$values[1])
+      }, error = function(e) {
+        return(rep(NA, n_samples + 1))
+      })
+      
+      if (length(maxSR_pert) > 1) return(maxSR_pert)  # NA fallback
+      
+      # ---- Vectorized SR computation (same pattern as permutation) ----
+      sumexp_m <- as.matrix(adj_pert %*% expr_sub)
+      
+      invP_m <- expr_sub * sumexp_m
+      nf <- colSums(invP_m)
+      nf[nf == 0] <- 1
+      invP_m <- t(t(invP_m) / nf)
+      
+      SR_vec <- numeric(n_samples)
+      for (s in seq_len(n_samples)) {
+        se <- sumexp_m[, s]
+        se[se == 0] <- 1
+        p_m <- t(t(adj_pert) * expr_sub[, s])
+        p_m <- p_m / se
+        
+        p_vals <- p_m@x
+        log_vals <- log(p_vals)
+        p_log <- p_m
+        p_log@x <- p_vals * log_vals
+        S_v <- -Matrix::rowSums(p_log)
+        
+        SR_vec[s] <- sum(invP_m[, s] * S_v) / maxSR_pert
+      }
+      
+      c(SR_vec, edge_count)
     }
-    SR_vec
+    
+    # ---- Parallel ----
+    cl <- parallel::makeCluster(n_cores)
+    parallel::clusterExport(cl, varlist = c(
+      "expr_sub", "adj_m", "edge_idx", "original_edges", "mc_genes",
+      "n_genes", "n_samples", "n_to_delete", "n_to_add", "iter_seeds"
+    ), envir = environment())
+    parallel::clusterEvalQ(cl, { library(Matrix); library(RSpectra) })
+    
+    raw <- parallel::parLapply(cl, seq_len(n_iterations), perturb_fn)
+    parallel::stopCluster(cl)
+    
+    raw_mat <- do.call(rbind, raw)
+    perturbed_SR <- raw_mat[, seq_len(n_samples), drop = FALSE]
+    edge_counts <- raw_mat[, n_samples + 1]
+    colnames(perturbed_SR) <- colnames(expr_sub)
+    
+    # ---- Statistics ----
+    cv_per_sample <- apply(perturbed_SR, 2, sd, na.rm = TRUE) /
+                     colMeans(perturbed_SR, na.rm = TRUE)
+    overall_cv <- mean(cv_per_sample, na.rm = TRUE)
+    mean_shift <- mean(colMeans(perturbed_SR, na.rm = TRUE) - original_SR, na.rm = TRUE)
+    
+    cat(sprintf("  Overall CV: %.4f (%.2f%%)\n", overall_cv, overall_cv * 100))
+    cat(sprintf("  Mean edges: %.0f (original: %d, change: %+.1f%%)\n",
+                mean(edge_counts, na.rm = TRUE), original_edges,
+                100 * (mean(edge_counts, na.rm = TRUE) - original_edges) / original_edges))
+    cat(sprintf("  Mean SR shift from original: %+.4f\n", mean_shift))
+    
+    if (overall_cv < 0.01) {
+      cat("  -> VERY ROBUST\n")
+    } else if (overall_cv < 0.05) {
+      cat("  -> ROBUST\n")
+    } else if (overall_cv < 0.10) {
+      cat("  -> MODERATE\n")
+    } else {
+      cat("  -> SENSITIVE\n")
+    }
+    
+    results_list[[paste0("rate_", rate)]] <- list(
+      perturbation_rate = rate,
+      perturbed_means = perturbed_SR,
+      original_means = original_SR,
+      cv_per_sample = cv_per_sample,
+      overall_cv = overall_cv,
+      mean_shift = mean_shift,
+      edge_counts = edge_counts
+    )
   }
   
-  # Parallel across permutations
-  # Replace the mclapply call with:
-cl <- parallel::makeCluster(n_cores)
-parallel::clusterExport(cl, varlist = c(
-  "expr_sub", "adj_m", "maxSR", "n_samples", "n_genes", "perm_seeds"
-), envir = environment())
-parallel::clusterEvalQ(cl, library(Matrix))
-
-permuted_SR <- do.call(rbind,
-  parallel::parLapply(cl, seq_len(n_permutations), perm_fn)
-)
-
-parallel::stopCluster(cl)
-  
-  # Statistics (unchanged)
-  perm_means <- colMeans(permuted_SR, na.rm = TRUE)
-  perm_sds <- apply(permuted_SR, 2, sd, na.rm = TRUE)
-  
-  z_scores <- (original_SR - perm_means) / perm_sds
-  
-  p_values <- vapply(seq_len(n_samples), function(s) {
-    perm_dist <- permuted_SR[, s]
-    mu <- mean(perm_dist)
-    mean(abs(perm_dist - mu) >= abs(original_SR[s] - mu))
-  }, numeric(1))
-  
-  cat("=== PERMUTATION RESULTS (Corrected SR) ===\n")
-  cat(sprintf("  Samples with p < 0.05: %d / %d (%.1f%%)\n",
-              sum(p_values < 0.05), n_samples,
-              100 * sum(p_values < 0.05) / n_samples))
-  cat(sprintf("  Mean |Z-score|: %.3f\n", mean(abs(z_scores))))
-  cat(sprintf("  Z-score range: %.3f to %.3f\n", min(z_scores), max(z_scores)))
-  cat(sprintf("  Observed SR mean: %.4f\n", mean(original_SR)))
-  cat(sprintf("  Permuted SR mean: %.4f\n\n", mean(perm_means)))
-  
-  frac_sig <- mean(p_values < 0.05)
-  if (frac_sig > 0.8) {
-    cat("  -> HIGHLY SIGNIFICANT: Network captures real biological signal\n\n")
-  } else if (frac_sig > 0.5) {
-    cat("  -> MODERATELY SIGNIFICANT\n\n")
-  } else {
-    cat("  -> NOT SIGNIFICANT\n\n")
+  cat("\n===== PERTURBATION SUMMARY =====\n")
+  for (rate_name in names(results_list)) {
+    r <- results_list[[rate_name]]
+    cat(sprintf("  %s: CV = %.4f (%.2f%%), shift = %+.4f\n",
+                rate_name, r$overall_cv, r$overall_cv * 100, r$mean_shift))
   }
+  cat("================================\n\n")
   
-  list(
-    permuted_means = permuted_SR,
-    original_means = original_SR,
-    p_values = p_values,
-    z_scores = z_scores
-  )
+  return(results_list)
 }
-expr_sub <- expr_corrected[mc_genes, , drop = FALSE]
-
-perm_results <- run_permutation_corrected(
+perturb_results <- run_perturbation_corrected(
+  network = ppi_net,
   adj_m = adj_m,
   expr_sub = expr_sub,
   maxSR = maxSR,
   original_SR = SR_per_sample,
-  n_permutations = 100,
-  seed = 456
+  perturbation_rates = c(0.05, 0.10, 0.20),
+  n_iterations = 100,
+  seed = 789
 )
-
-# Export
-perm_summary <- data.frame(
-  sample = colnames(expr_sub),
-  original_SR = perm_results$original_means,
-  permuted_mean = colMeans(perm_results$permuted_means, na.rm = TRUE),
-  permuted_sd = apply(perm_results$permuted_means, 2, sd, na.rm = TRUE),
-  z_score = perm_results$z_scores,
-  p_value = perm_results$p_values
-)
-write.csv(perm_summary, "permutation_corrected_summary.csv", row.names = FALSE)
-write.csv(perm_results$permuted_means, "permutation_corrected_means.csv", row.names = FALSE)
-cat("Saved: permutation_corrected_summary.csv, permutation_corrected_means.csv\n\n")
