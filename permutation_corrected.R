@@ -1,95 +1,91 @@
-compute_SR_one_sample <- function(exp_v, adj_m, maxSR) {
-  
-  n <- length(exp_v)
-  
-  # Mass action: sumexp_i = sum_j A_ij * x_j
-  sumexp_v <- as.vector(adj_m %*% matrix(exp_v, ncol = 1))
-  
-  # Stationary distribution: pi_i = x_i * sumexp_i / norm
-  invP_v <- exp_v * sumexp_v
-  nf <- sum(invP_v)
-  
-  if (nf == 0) return(list(SR = NA, local_S = rep(NA, n)))
-  
-  invP_v <- invP_v / nf
-  
-  # Stochastic matrix: p_ij = A_ij * x_j / sumexp_i
-  safe_sumexp <- sumexp_v
-  safe_sumexp[safe_sumexp == 0] <- 1
-  p_m <- t(t(adj_m) * exp_v) / safe_sumexp
-  
-  # Local entropy: S_i = -sum_j p_ij * log(p_ij)
-  # Vectorized using rowSums
-  log_p <- matrix(0, nrow = nrow(p_m), ncol = ncol(p_m))
-  nonzero <- p_m > 0
-  log_p[nonzero] <- log(p_m[nonzero])
-  S_v <- -rowSums(p_m * log_p)
-  
-  # Entropy rate: SR = sum(pi_i * S_i) / maxSR
-  SR <- sum(invP_v * S_v) / maxSR
-  
-  return(list(SR = SR, local_S = S_v))
-}
-
-
-compute_SR_all_samples <- function(expr_sub, adj_m, maxSR) {
-  
-  n_samples <- ncol(expr_sub)
-  SR_vec <- numeric(n_samples)
-  
-  for (s in 1:n_samples) {
-    exp_v <- as.numeric(expr_sub[, s])
-    result <- compute_SR_one_sample(exp_v, adj_m, maxSR)
-    SR_vec[s] <- result$SR
-  }
-  
-  return(SR_vec)
-}
-
-
 run_permutation_corrected <- function(adj_m, expr_sub, maxSR,
                                       original_SR,
                                       n_permutations = 100,
-                                      seed = 456) {
-  set.seed(seed)
+                                      seed = 456,
+                                      n_cores = parallel::detectCores() - 1) {
+  
+  # Convert to sparse once — ~99% of adj_m is zeros
+  if (!inherits(adj_m, "sparseMatrix")) {
+    adj_m <- Matrix::Matrix(adj_m, sparse = TRUE)
+  }
   
   n_samples <- ncol(expr_sub)
   n_genes <- nrow(expr_sub)
   
-  permuted_SR <- matrix(NA, nrow = n_permutations, ncol = n_samples)
-  colnames(permuted_SR) <- colnames(expr_sub)
+  cat("Running", n_permutations, "permutations (corrected SR) on", n_cores, "cores...\n")
   
-  cat("Running", n_permutations, "permutations (corrected SR)...\n")
+  # Reproducible parallel seeds
+  set.seed(seed)
+  perm_seeds <- sample.int(.Machine$integer.max, n_permutations)
   
-  for (perm in 1:n_permutations) {
-    if (perm %% 10 == 0) cat(sprintf("  Permutation %d/%d\r", perm, n_permutations))
+  perm_fn <- function(i) {
+    set.seed(perm_seeds[i])
     
-    # Shuffle expression within each sample column
-    expr_permuted <- expr_sub
-    for (s in 1:n_samples) {
-      expr_permuted[, s] <- sample(expr_sub[, s])
+    # Shuffle within each column via index matrix
+    perm_idx <- vapply(seq_len(n_samples), function(j) sample.int(n_genes),
+                       integer(n_genes))
+    perm_exp <- expr_sub[cbind(as.vector(perm_idx),
+                  rep(seq_len(n_samples), each = n_genes))]
+    dim(perm_exp) <- dim(expr_sub)
+    
+    # Vectorized SR for ALL samples at once (matrix-matrix multiply)
+    # Mass action: sumexp = A %*% X  (genes x samples, one shot)
+    sumexp_m <- as.matrix(adj_m %*% perm_exp)
+    
+    # Stationary distribution: pi_i = x_i * sumexp_i / Z
+    invP_m <- perm_exp * sumexp_m
+    nf <- colSums(invP_m)
+    nf[nf == 0] <- 1
+    invP_m <- t(t(invP_m) / nf)
+    
+    # Stochastic matrix per sample and local entropy
+    # Done sample-by-sample here because p_m is genes x genes per sample
+    SR_vec <- numeric(n_samples)
+    for (s in seq_len(n_samples)) {
+      se <- sumexp_m[, s]
+      se[se == 0] <- 1
+      # WRONG:  adj_m * perm_exp[, s]          → row-wise (x_i)
+# RIGHT:  t(t(adj_m) * perm_exp[, s])    → column-wise (x_j)
+      p_m <- t(t(adj_m) * perm_exp[, s])
+      p_m <- p_m / se
+      
+      # Local entropy via sparse operations
+      p_vals <- p_m@x               # nonzero entries only
+      log_vals <- log(p_vals)
+      p_log <- p_m
+      p_log@x <- p_vals * log_vals
+      S_v <- -Matrix::rowSums(p_log)
+      
+      SR_vec[s] <- sum(invP_m[, s] * S_v) / maxSR
     }
-    
-    # Compute SR for all samples with permuted data
-    permuted_SR[perm, ] <- compute_SR_all_samples(expr_permuted, adj_m, maxSR)
+    SR_vec
   }
   
-  cat("\n\n")
+  # Parallel across permutations
+  # Replace the mclapply call with:
+cl <- parallel::makeCluster(n_cores)
+parallel::clusterExport(cl, varlist = c(
+  "expr_sub", "adj_m", "maxSR", "n_samples", "n_genes", "perm_seeds"
+), envir = environment())
+parallel::clusterEvalQ(cl, library(Matrix))
+
+permuted_SR <- do.call(rbind,
+  parallel::parLapply(cl, seq_len(n_permutations), perm_fn)
+)
+
+parallel::stopCluster(cl)
   
-  # Statistics
-  p_values <- numeric(n_samples)
-  z_scores <- numeric(n_samples)
+  # Statistics (unchanged)
+  perm_means <- colMeans(permuted_SR, na.rm = TRUE)
+  perm_sds <- apply(permuted_SR, 2, sd, na.rm = TRUE)
   
-  for (s in 1:n_samples) {
+  z_scores <- (original_SR - perm_means) / perm_sds
+  
+  p_values <- vapply(seq_len(n_samples), function(s) {
     perm_dist <- permuted_SR[, s]
-    obs_val <- original_SR[s]
-    
-    # Two-tailed p-value
-    p_values[s] <- mean(abs(perm_dist - mean(perm_dist)) >= abs(obs_val - mean(perm_dist)))
-    
-    # Z-score
-    z_scores[s] <- (obs_val - mean(perm_dist)) / sd(perm_dist)
-  }
+    mu <- mean(perm_dist)
+    mean(abs(perm_dist - mu) >= abs(original_SR[s] - mu))
+  }, numeric(1))
   
   cat("=== PERMUTATION RESULTS (Corrected SR) ===\n")
   cat(sprintf("  Samples with p < 0.05: %d / %d (%.1f%%)\n",
@@ -98,22 +94,44 @@ run_permutation_corrected <- function(adj_m, expr_sub, maxSR,
   cat(sprintf("  Mean |Z-score|: %.3f\n", mean(abs(z_scores))))
   cat(sprintf("  Z-score range: %.3f to %.3f\n", min(z_scores), max(z_scores)))
   cat(sprintf("  Observed SR mean: %.4f\n", mean(original_SR)))
-  cat(sprintf("  Permuted SR mean: %.4f\n\n", mean(colMeans(permuted_SR, na.rm = TRUE))))
+  cat(sprintf("  Permuted SR mean: %.4f\n\n", mean(perm_means)))
   
-  if (mean(p_values < 0.05) > 0.8) {
+  frac_sig <- mean(p_values < 0.05)
+  if (frac_sig > 0.8) {
     cat("  -> HIGHLY SIGNIFICANT: Network captures real biological signal\n\n")
-  } else if (mean(p_values < 0.05) > 0.5) {
+  } else if (frac_sig > 0.5) {
     cat("  -> MODERATELY SIGNIFICANT\n\n")
   } else {
     cat("  -> NOT SIGNIFICANT\n\n")
   }
   
-  results <- list(
+  list(
     permuted_means = permuted_SR,
     original_means = original_SR,
     p_values = p_values,
     z_scores = z_scores
   )
-  
-  return(results)
 }
+expr_sub <- expr_corrected[mc_genes, , drop = FALSE]
+
+perm_results <- run_permutation_corrected(
+  adj_m = adj_m,
+  expr_sub = expr_sub,
+  maxSR = maxSR,
+  original_SR = SR_per_sample,
+  n_permutations = 100,
+  seed = 456
+)
+
+# Export
+perm_summary <- data.frame(
+  sample = colnames(expr_sub),
+  original_SR = perm_results$original_means,
+  permuted_mean = colMeans(perm_results$permuted_means, na.rm = TRUE),
+  permuted_sd = apply(perm_results$permuted_means, 2, sd, na.rm = TRUE),
+  z_score = perm_results$z_scores,
+  p_value = perm_results$p_values
+)
+write.csv(perm_summary, "permutation_corrected_summary.csv", row.names = FALSE)
+write.csv(perm_results$permuted_means, "permutation_corrected_means.csv", row.names = FALSE)
+cat("Saved: permutation_corrected_summary.csv, permutation_corrected_means.csv\n\n")
